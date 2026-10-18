@@ -387,8 +387,16 @@ void check_tlb_flush(CPUPPCState *env, bool global)
                     need & (TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH) : 0;
 
 #if defined(TARGET_PPC64)
+    /* QEMU_PPC_TLBIE_FULL=1: flush whole TLBs as before (A/B testing) */
+    static int tlbie_full = -1;
+
+    if (tlbie_full < 0) {
+        const char *e = getenv("QEMU_PPC_TLBIE_FULL");
+
+        tlbie_full = e && *e && strcmp(e, "0");
+    }
     /* tlbie on the 970: only the translations of the pages it names */
-    if ((need & TLB_NEED_PAGES_FLUSH) &&
+    if (!tlbie_full && (need & TLB_NEED_PAGES_FLUSH) &&
         env->tlbie_pages_nb <= TLBIE_PAGES_MAX) {
         if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
             if (need & TLB_NEED_LOCAL_FLUSH) {
