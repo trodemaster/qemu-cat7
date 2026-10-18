@@ -25,6 +25,8 @@
 #include "exec/target_page.h"
 #include "qemu/error-report.h"
 #include "qemu/qemu-print.h"
+#include "qemu/main-loop.h"
+#include "qemu/processor.h"
 #include "system/hw_accel.h"
 #include "system/memory.h"
 #include "kvm_ppc.h"
@@ -1321,6 +1323,101 @@ static void hash64_tlbie_sync(CPUState *cs, run_on_cpu_data data)
 }
 
 /*
+ * The mailbox way of completing a tlbie on other CPUs: the issuer posts
+ * the pages to each CPU that needs them, makes it leave its chain of TBs
+ * and waits until it has dropped them. A CPU serves its mailbox between
+ * TBs and on entering cpu_exec, without the BQL and without leaving
+ * cpu_exec, and CPUs not involved go on running. A CPU that isn't running
+ * TBs is not waited for: it serves its mailbox before it runs any.
+ *
+ * QEMU_PPC_TLBIE_SYNC=exclusive goes through the CPUs' work queues and an
+ * exclusive section instead, stopping every CPU (A/B testing).
+ */
+static bool hash64_tlbie_exclusive(void)
+{
+    static int excl = -1;
+
+    if (excl < 0) {
+        const char *e = getenv("QEMU_PPC_TLBIE_SYNC");
+
+        excl = e && !strcmp(e, "exclusive");
+    }
+    return excl;
+}
+
+void ppc_hash64_tlbie_poll(PowerPCCPU *cpu)
+{
+    PPCTlbieMbox *mb = &cpu->tlbie_mbox;
+    target_ulong rbs[TLBIE_PAGES_MAX];
+    uint32_t req, nb;
+
+    if (qatomic_read(&mb->req) == qatomic_read(&mb->done)) {
+        return;
+    }
+    qemu_spin_lock(&mb->lock);
+    req = mb->req;
+    nb = mb->nb;
+    if (nb <= TLBIE_PAGES_MAX) {
+        memcpy(rbs, mb->rbs, sizeof(rbs[0]) * nb);
+    }
+    mb->nb = 0;
+    qemu_spin_unlock(&mb->lock);
+
+    if (nb > TLBIE_PAGES_MAX ||
+        (cpu->env.tlb_need_flush & TLB_NEED_LOCAL_FLUSH)) {
+        tlb_flush(CPU(cpu));
+    } else {
+        hash64_tlbie_cpu(cpu, rbs, nb, true);
+    }
+    qatomic_store_release(&mb->done, req);
+}
+
+/* Queue @nb pages for @other to drop; returns the request to wait for */
+static uint32_t hash64_tlbie_post(PowerPCCPU *other, const target_ulong *rbs,
+                                  unsigned nb)
+{
+    PPCTlbieMbox *mb = &other->tlbie_mbox;
+    uint32_t req;
+
+    qemu_spin_lock(&mb->lock);
+    if (mb->nb + nb > TLBIE_PAGES_MAX) {
+        mb->nb = TLBIE_PAGES_MAX + 1;
+    } else {
+        memcpy(mb->rbs + mb->nb, rbs, sizeof(rbs[0]) * nb);
+        mb->nb += nb;
+    }
+    req = mb->req + 1;
+    qatomic_set(&mb->req, req);
+    qemu_spin_unlock(&mb->lock);
+    return req;
+}
+
+
+/* Wait until @other has served request @req, or isn't running TBs */
+static void hash64_tlbie_wait(PowerPCCPU *cpu, PowerPCCPU *other,
+                              uint32_t req)
+{
+    PPCTlbieMbox *mb = &other->tlbie_mbox;
+    unsigned spins = 0;
+
+    while ((int32_t)(qatomic_load_acquire(&mb->done) - req) < 0 &&
+           qatomic_read(&CPU(other)->running)) {
+        /* It may be waiting for us in turn */
+        ppc_hash64_tlbie_poll(cpu);
+        /*
+         * The wait is usually a few us. sched_yield() can park the thread
+         * for ms on macOS with the other vCPUs runnable, so only yield now
+         * and then, in case the other vCPU's thread isn't running.
+         */
+        if (++spins % 65536) {
+            cpu_relax();
+        } else {
+            sched_yield();
+        }
+    }
+}
+
+/*
  * Complete the tlbie pages of @cpu: in its own TLB and, when @global, in
  * the TLBs of the CPUs that hold one of their segments, the issuing CPU
  * then waiting for them as for a broadcast flush.
@@ -1329,6 +1426,8 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
 {
     CPUPPCState *env = &cpu->env;
     CPUState *src = CPU(cpu), *cs;
+    uint32_t reqs[64];
+    bool mbox = !hash64_tlbie_exclusive() && !bql_locked();
     bool remote = false;
 
     hash64_tlbie_cpu(cpu, env->tlbie_pages, env->tlbie_pages_nb, true);
@@ -1336,9 +1435,17 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
         return;
     }
     CPU_FOREACH(cs) {
+        if (cs->cpu_index >= ARRAY_SIZE(reqs)) {
+            mbox = false;
+        }
+    }
+    CPU_FOREACH(cs) {
         PowerPCCPU *other = POWERPC_CPU(cs);
         Hash64TlbiePages *p;
 
+        if (mbox) {
+            reqs[cs->cpu_index] = 0;
+        }
         if (cs == src) {
             continue;
         }
@@ -1351,14 +1458,37 @@ void ppc_hash64_tlbie_pages(PowerPCCPU *cpu, bool global)
                 continue;
             }
         }
+        remote = true;
+        if (mbox) {
+            reqs[cs->cpu_index] = hash64_tlbie_post(other, env->tlbie_pages,
+                                                    env->tlbie_pages_nb);
+            continue;
+        }
         p = g_new(Hash64TlbiePages, 1);
         p->nb = env->tlbie_pages_nb;
         memcpy(p->rbs, env->tlbie_pages, sizeof(p->rbs[0]) * p->nb);
         async_run_on_cpu(cs, hash64_tlbie_work, RUN_ON_CPU_HOST_PTR(p));
-        remote = true;
     }
-    if (remote) {
+    if (!remote) {
+        return;
+    }
+    if (!mbox) {
         async_safe_run_on_cpu(src, hash64_tlbie_sync, RUN_ON_CPU_NULL);
+        return;
+    }
+
+    /* Posts before reading running, pairs with cpu_exec_start() */
+    smp_mb();
+    CPU_FOREACH(cs) {
+        if (reqs[cs->cpu_index]) {
+            /* Leave the chain of TBs and poll, as cpu_exit() but no exit */
+            qatomic_set(&cs->neg.icount_decr.u16.high, -1);
+        }
+    }
+    CPU_FOREACH(cs) {
+        if (reqs[cs->cpu_index]) {
+            hash64_tlbie_wait(cpu, POWERPC_CPU(cs), reqs[cs->cpu_index]);
+        }
     }
 }
 
@@ -1393,6 +1523,7 @@ void ppc_hash64_init(PowerPCCPU *cpu)
     }
 
     cpu->hash64_opts = g_memdup2(pcc->hash64_opts, sizeof(*cpu->hash64_opts));
+    qemu_spin_init(&cpu->tlbie_mbox.lock);
 }
 
 void ppc_hash64_finalize(PowerPCCPU *cpu)
