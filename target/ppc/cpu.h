@@ -1538,6 +1538,7 @@ typedef struct PPCTlbieMbox {
     uint32_t done;
     uint32_t nb;            /* > TLBIE_PAGES_MAX: drop the whole TLB */
     target_ulong rbs[TLBIE_PAGES_MAX];
+    int64_t served_ns;      /* when done last advanced (statistics) */
 } PPCTlbieMbox;
 #endif
 

@@ -1345,6 +1345,16 @@ static bool hash64_tlbie_exclusive(void)
     return excl;
 }
 
+/*
+ * QEMU_PPC_TLBIE_STATS=1: every 5 s, log how many CPUs tlbie waited for and
+ * how long, and the state of the first CPUs it waited over 1 ms for.
+ */
+static struct {
+    int on;
+    uint64_t waits, wait_ns, max_ns, slow, slow_logged, serve_ns;
+    int64_t last;
+} tlbie_stats = { .on = -1 };
+
 void ppc_hash64_tlbie_poll(PowerPCCPU *cpu)
 {
     PPCTlbieMbox *mb = &cpu->tlbie_mbox;
@@ -1368,6 +1378,9 @@ void ppc_hash64_tlbie_poll(PowerPCCPU *cpu)
         tlb_flush(CPU(cpu));
     } else {
         hash64_tlbie_cpu(cpu, rbs, nb, true);
+    }
+    if (tlbie_stats.on > 0) {
+        qatomic_set(&mb->served_ns, get_clock());
     }
     qatomic_store_release(&mb->done, req);
 }
@@ -1393,12 +1406,65 @@ static uint32_t hash64_tlbie_post(PowerPCCPU *other, const target_ulong *rbs,
 }
 
 
+static void hash64_tlbie_stat(PowerPCCPU *other, int64_t t0, int64_t ns)
+{
+    int64_t served = qatomic_read(&other->tlbie_mbox.served_ns);
+    int64_t serve = served > t0 ? served - t0 : 0;
+
+    CPUState *cs = CPU(other);
+    int64_t now;
+
+    if (tlbie_stats.on < 0) {
+        const char *e = getenv("QEMU_PPC_TLBIE_STATS");
+
+        tlbie_stats.on = e && *e && strcmp(e, "0");
+    }
+    if (!tlbie_stats.on) {
+        return;
+    }
+    qatomic_inc(&tlbie_stats.waits);
+    qatomic_add(&tlbie_stats.wait_ns, ns);
+    qatomic_add(&tlbie_stats.serve_ns, serve);
+    if (ns > qatomic_read(&tlbie_stats.max_ns)) {
+        qatomic_set(&tlbie_stats.max_ns, ns);
+    }
+    if (ns > SCALE_MS) {
+        qatomic_inc(&tlbie_stats.slow);
+        if (qatomic_fetch_inc(&tlbie_stats.slow_logged) < 20) {
+            qemu_log("tlbie: waited %" PRId64 " us (served after %" PRId64
+                     " us) for cpu %d: running %d "
+                     "halted %d irq %x exit %d high %d nip %" PRIx64
+                     " bql %d\n", ns / SCALE_US, serve / SCALE_US, cs->cpu_index,
+                     qatomic_read(&cs->running), cs->halted,
+                     qatomic_read(&cs->interrupt_request),
+                     qatomic_read(&cs->exit_request),
+                     (int16_t)qatomic_read(&cs->neg.icount_decr.u16.high),
+                     (uint64_t)other->env.nip, bql_locked());
+        }
+    }
+    now = get_clock();
+    if (now - qatomic_read(&tlbie_stats.last) > 5 * NANOSECONDS_PER_SECOND) {
+        uint64_t w = qatomic_xchg(&tlbie_stats.waits, 0);
+        uint64_t t = qatomic_xchg(&tlbie_stats.wait_ns, 0);
+        uint64_t sv = qatomic_xchg(&tlbie_stats.serve_ns, 0);
+
+        qatomic_set(&tlbie_stats.last, now);
+        qemu_log("tlbie: %" PRIu64 " waits in 5 s, mean %" PRIu64 " us "
+                 "(served after %" PRIu64 " us), max %" PRIu64 " us, %"
+                 PRIu64 " over 1 ms\n", w,
+                 w ? t / w / SCALE_US : 0, w ? sv / w / SCALE_US : 0,
+                 qatomic_xchg(&tlbie_stats.max_ns, 0) / SCALE_US,
+                 qatomic_xchg(&tlbie_stats.slow, 0));
+    }
+}
+
 /* Wait until @other has served request @req, or isn't running TBs */
 static void hash64_tlbie_wait(PowerPCCPU *cpu, PowerPCCPU *other,
                               uint32_t req)
 {
     PPCTlbieMbox *mb = &other->tlbie_mbox;
     unsigned spins = 0;
+    int64_t t0 = get_clock();
 
     while ((int32_t)(qatomic_load_acquire(&mb->done) - req) < 0 &&
            qatomic_read(&CPU(other)->running)) {
@@ -1415,6 +1481,7 @@ static void hash64_tlbie_wait(PowerPCCPU *cpu, PowerPCCPU *other,
             sched_yield();
         }
     }
+    hash64_tlbie_stat(other, t0, get_clock() - t0);
 }
 
 /*
