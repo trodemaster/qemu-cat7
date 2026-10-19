@@ -1526,6 +1526,22 @@ typedef struct PPCVirtualHypervisorClass PPCVirtualHypervisorClass;
  *
  * A PowerPC CPU.
  */
+#if defined(TARGET_PPC64) && !defined(CONFIG_USER_ONLY)
+/*
+ * tlbie pages other CPUs asked this one to drop (mmu-hash64.c). It drops
+ * them between TBs; req counts the requests posted under lock, done the
+ * ones served, so a sender waits for done to reach its own.
+ */
+typedef struct PPCTlbieMbox {
+    QemuSpin lock;
+    uint32_t req;
+    uint32_t done;
+    uint32_t nb;            /* > TLBIE_PAGES_MAX: drop the whole TLB */
+    target_ulong rbs[TLBIE_PAGES_MAX];
+    int64_t served_ns;      /* when done last advanced (statistics) */
+} PPCTlbieMbox;
+#endif
+
 struct ArchCPU {
     CPUState parent_obj;
 
@@ -1539,6 +1555,10 @@ struct ArchCPU {
     int32_t node_id; /* NUMA node this CPU belongs to */
     PPCHash64Options *hash64_opts;
     bool rtas_stopped_state;
+
+#if defined(TARGET_PPC64) && !defined(CONFIG_USER_ONLY)
+    PPCTlbieMbox tlbie_mbox;
+#endif
 
     /* Those resources are used only during code translation */
     /* opcode handlers */

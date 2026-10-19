@@ -797,6 +797,10 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
      */
     qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
 
+    if (cpu->cc->tcg_ops->cpu_exec_poll) {
+        cpu->cc->tcg_ops->cpu_exec_poll(cpu);
+    }
+
 #ifdef CONFIG_USER_ONLY
     assert(!cpu_test_interrupt(cpu, ~0));
 #else

@@ -98,6 +98,13 @@ struct TCGCPUOps {
     void (*cpu_exec_enter)(CPUState *cpu);
     /** @cpu_exec_exit: Callback for cpu_exec cleanup */
     void (*cpu_exec_exit)(CPUState *cpu);
+    /**
+     * @cpu_exec_poll: Callback between TBs, outside the BQL, each time
+     * something stopped the chaining of TBs (icount_decr.u16.high), for
+     * requests from other vCPUs that must be served without leaving
+     * cpu_exec. Called on the vCPU's own thread.
+     */
+    void (*cpu_exec_poll)(CPUState *cpu);
     /** @debug_excp_handler: Callback for handling debug exceptions */
     void (*debug_excp_handler)(CPUState *cpu);
 

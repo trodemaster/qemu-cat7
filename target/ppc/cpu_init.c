@@ -7424,7 +7424,18 @@ static void ppc_cpu_exec_enter(CPUState *cs)
     if (cpu->vhyp) {
         cpu->vhyp_class->cpu_exec_enter(cpu->vhyp, cpu);
     }
+#ifdef TARGET_PPC64
+    /* tlbie pages posted while this CPU wasn't running TBs */
+    ppc_hash64_tlbie_poll(cpu);
+#endif
 }
+
+#ifdef TARGET_PPC64
+static void ppc_cpu_exec_poll(CPUState *cs)
+{
+    ppc_hash64_tlbie_poll(POWERPC_CPU(cs));
+}
+#endif
 
 static void ppc_cpu_exec_exit(CPUState *cs)
 {
@@ -7549,6 +7560,9 @@ static const TCGCPUOps ppc_tcg_ops = {
   .do_interrupt = ppc_cpu_do_interrupt,
   .cpu_exec_enter = ppc_cpu_exec_enter,
   .cpu_exec_exit = ppc_cpu_exec_exit,
+#ifdef TARGET_PPC64
+  .cpu_exec_poll = ppc_cpu_exec_poll,
+#endif
   .do_unaligned_access = ppc_cpu_do_unaligned_access,
   .do_transaction_failed = ppc_cpu_do_transaction_failed,
   .debug_excp_handler = ppc_cpu_debug_excp_handler,
