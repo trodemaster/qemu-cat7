@@ -44,6 +44,9 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
+#include "hw/core/cpu.h"
+#include "exec/cpu-interrupt.h"
 
 /* #define DEBUG_OPENPIC */
 
@@ -217,8 +220,112 @@ static int openpic_alias_ipidr(OpenPICState *opp, hwaddr addr, uint32_t val)
     return n;
 }
 
+/*
+ * IPI latency tracing, for the SMP guest hangs: QEMU_OPENPIC_IPI_TRACE=<ms>
+ * logs (to the -D log) every IPI not acknowledged within that time, split
+ * into dispatch to INT raised and INT raised to IACK, and every IPI still
+ * pending after it, with the state of its CPU and of the MPIC destination.
+ * Off when unset; the bookkeeping is only done under the BQL.
+ */
+static int64_t ipi_trace_ns = -1;
+static int64_t ipi_sent_ns[MAX_CPU];    /* first dispatch not yet taken */
+static bool ipi_logged[MAX_CPU];        /* this one's delay already logged */
+static int64_t int_raised_ns[MAX_CPU];  /* INT output went up, 0 if low */
+static QEMUTimer *ipi_trace_timer;
+
+static bool ipi_trace(void)
+{
+    if (ipi_trace_ns < 0) {
+        const char *e = getenv("QEMU_OPENPIC_IPI_TRACE");
+
+        ipi_trace_ns = e ? atoll(e) * SCALE_MS : 0;
+    }
+    return ipi_trace_ns > 0;
+}
+
+static void openpic_int_raise(OpenPICState *opp, int n_CPU)
+{
+    if (ipi_trace() && !int_raised_ns[n_CPU]) {
+        int_raised_ns[n_CPU] = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
+    qemu_irq_raise(opp->dst[n_CPU].irqs[OPENPIC_OUTPUT_INT]);
+}
+
+static void openpic_int_lower(OpenPICState *opp, int n_CPU)
+{
+    int_raised_ns[n_CPU] = 0;
+    qemu_irq_lower(opp->dst[n_CPU].irqs[OPENPIC_OUTPUT_INT]);
+}
+
+static void ipi_trace_dump(OpenPICState *opp, int ch, const char *what,
+                           int64_t now, int64_t raised)
+{
+    IRQSource *src = &opp->src[opp->irq_ipi0 + ch];
+    int n = ch < opp->nb_cpus ? ch : 0;
+    IRQDest *dst = &opp->dst[n];
+    CPUState *cs = qemu_get_cpu(n);
+
+    qemu_log("openpic: IPI ch %d %s %" PRId64 " ms after dispatch: "
+             "INT %s%" PRId64 " ms ago; ivpr %08x destmask %08x pending %d; "
+             "dst %d ctpr %d raised %d/%d servicing %d/%d; "
+             "cpu halted %d HARD %d pc %" PRIx64 "\n",
+             ch, what, (now - ipi_sent_ns[ch]) / SCALE_MS,
+             raised ? "raised " : "low, ",
+             raised ? (now - raised) / SCALE_MS : 0,
+             src->ivpr, src->destmask, src->pending,
+             n, dst->ctpr, dst->raised.next, dst->raised.priority,
+             dst->servicing.next, dst->servicing.priority,
+             cs ? cs->halted : -1,
+             cs ? cpu_test_interrupt(cs, CPU_INTERRUPT_HARD) : -1,
+             cs && cs->cc->get_pc ? (uint64_t)cs->cc->get_pc(cs) : 0);
+}
+
+static void ipi_trace_tick(void *opaque)
+{
+    OpenPICState *opp = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int ch;
+
+    for (ch = 0; ch < opp->nb_ipi && ch < MAX_CPU; ch++) {
+        if (ipi_sent_ns[ch] && !ipi_logged[ch] &&
+            now - ipi_sent_ns[ch] > ipi_trace_ns) {
+            ipi_trace_dump(opp, ch, "still pending", now,
+                           int_raised_ns[ch < opp->nb_cpus ? ch : 0]);
+            ipi_logged[ch] = true;
+        }
+    }
+    timer_mod(ipi_trace_timer, now + 10 * SCALE_MS);
+}
+
+/* At IACK of IPI channel @ch; @raised: when the INT output went up */
+static void ipi_trace_taken(OpenPICState *opp, int ch, int64_t raised)
+{
+    int64_t now;
+
+    if (!ipi_trace() || ch >= MAX_CPU || !ipi_sent_ns[ch]) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (now - ipi_sent_ns[ch] > ipi_trace_ns) {
+        ipi_trace_dump(opp, ch, "taken", now, raised);
+    }
+    ipi_sent_ns[ch] = 0;
+    ipi_logged[ch] = false;
+}
+
 static void openpic_ipi_dispatch(OpenPICState *opp, int ch, uint32_t val)
 {
+    if (ipi_trace() && ch < MAX_CPU) {
+        if (!ipi_trace_timer) {
+            ipi_trace_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
+                                           ipi_trace_tick, opp);
+            timer_mod(ipi_trace_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 10 * SCALE_MS);
+        }
+        if (!ipi_sent_ns[ch]) {
+            ipi_sent_ns[ch] = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        }
+    }
     /* we use IDE as mask which CPUs to deliver the IPI to still. */
     opp->src[opp->irq_ipi0 + ch].destmask |= val;
     openpic_set_irq(opp, opp->irq_ipi0 + ch, 1);
@@ -354,7 +461,7 @@ static void IRQ_local_pipe(OpenPICState *opp, int n_CPU, int n_IRQ,
         } else {
             DPRINTF("%s: Raise OpenPIC INT output cpu %d irq %d/%d",
                     __func__, n_CPU, n_IRQ, dst->raised.next);
-            qemu_irq_raise(opp->dst[n_CPU].irqs[OPENPIC_OUTPUT_INT]);
+            openpic_int_raise(opp, n_CPU);
         }
     } else {
         IRQ_get_next(opp, &dst->servicing);
@@ -367,7 +474,7 @@ static void IRQ_local_pipe(OpenPICState *opp, int n_CPU, int n_IRQ,
         } else {
             DPRINTF("%s: IRQ %d inactive, current prio %d/%d, CPU %d",
                     __func__, n_IRQ, dst->ctpr, dst->servicing.priority, n_CPU);
-            qemu_irq_lower(opp->dst[n_CPU].irqs[OPENPIC_OUTPUT_INT]);
+            openpic_int_lower(opp, n_CPU);
         }
     }
 }
@@ -1117,11 +1224,11 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
         if (dst->raised.priority <= dst->ctpr) {
             DPRINTF("%s: Lower OpenPIC INT output cpu %d due to ctpr",
                     __func__, idx);
-            qemu_irq_lower(dst->irqs[OPENPIC_OUTPUT_INT]);
+            openpic_int_lower(opp, idx);
         } else if (dst->raised.priority > dst->servicing.priority) {
             DPRINTF("%s: Raise OpenPIC INT output cpu %d irq %d",
                     __func__, idx, dst->raised.next);
-            qemu_irq_raise(dst->irqs[OPENPIC_OUTPUT_INT]);
+            openpic_int_raise(opp, idx);
         }
 
         break;
@@ -1152,7 +1259,7 @@ static void openpic_cpu_write_internal(void *opaque, hwaddr addr,
                  IVPR_PRIORITY(src->ivpr) > dst->servicing.priority)) {
                 DPRINTF("Raise OpenPIC INT output cpu %d irq %d",
                         idx, n_IRQ);
-                qemu_irq_raise(opp->dst[idx].irqs[OPENPIC_OUTPUT_INT]);
+                openpic_int_raise(opp, idx);
             }
         }
         break;
@@ -1172,9 +1279,11 @@ static uint32_t openpic_iack(OpenPICState *opp, IRQDest *dst, int cpu)
 {
     IRQSource *src;
     int retval, irq;
+    int64_t raised;
 
     DPRINTF("Lower OpenPIC INT output");
-    qemu_irq_lower(dst->irqs[OPENPIC_OUTPUT_INT]);
+    raised = int_raised_ns[cpu];
+    openpic_int_lower(opp, cpu);
 
     irq = IRQ_get_next(opp, &dst->raised);
     DPRINTF("IACK: irq=%d", irq);
@@ -1203,6 +1312,10 @@ static uint32_t openpic_iack(OpenPICState *opp, IRQDest *dst, int cpu)
         src->ivpr &= ~IVPR_ACTIVITY_MASK;
         src->pending = 0;
         IRQ_resetbit(&dst->raised, irq);
+    }
+
+    if (irq >= opp->irq_ipi0 && irq < opp->irq_ipi0 + opp->nb_ipi) {
+        ipi_trace_taken(opp, irq - opp->irq_ipi0, raised);
     }
 
     /* Timers and IPIs support multicast. */
