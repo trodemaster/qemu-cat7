@@ -1220,6 +1220,16 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaAppController: applicationDidFinishLaunching\n");
     allow_events = true;
+
+    /*
+     * Keep App Nap away for as long as we run: whenever the window isn't
+     * frontmost, it would run every vCPU thread at background QoS, on the
+     * efficiency cores and throttled.
+     */
+    [[[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
+                                 NSActivityLatencyCritical
+                          reason:@"QEMU is running a virtual machine"] retain];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification
